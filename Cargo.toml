@@ -1,0 +1,18 @@
+[package]
+name = "shard-csv"
+authors = ["Adam Shirey <adam@shirey.ch>"]
+version = "0.1.0"
+edition = "2018"
+
+
+description = "A library to aid in splitting CSV/TSV files into multiple disjoint files."
+readme = "README.md"
+homepage = "https://github.com/aeshirey/shard-csv/"
+repository = "https://github.com/aeshirey/shard-csv/"
+license = "MIT OR Apache-2.0"
+keywords = ["csv", "tsv", "split"]
+categories = ["filesystem"]
+
+
+[dependencies]
+csv = "1.1.6"
