@@ -2,6 +2,8 @@ mod shard;
 mod sharded_writer;
 pub use sharded_writer::ShardedWriter;
 
+
+/// Defines how input headers should be handled
 #[derive(Clone, Copy, Debug)]
 pub enum HeaderHandling {
     /// The input file does not have a header
@@ -14,7 +16,7 @@ pub enum HeaderHandling {
     KeepHeader,
 }
 
-/// Dictates how output files will be split
+/// Defines how output files will be split
 #[derive(Clone, Copy, Debug)]
 pub enum FileSplitting {
     /// Output files won't be split

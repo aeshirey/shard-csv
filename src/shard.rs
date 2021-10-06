@@ -1,7 +1,7 @@
 use crate::{Error, FileSplitting};
 use csv::{StringRecord, Writer};
 use std::{
-    fs::File,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -9,7 +9,7 @@ use std::{
 struct ShardFile {
     path: PathBuf,
     key: String,
-    writer: Writer<File>,
+    writer: Writer<Box<dyn Write>>,
     written: usize,
     splitting: FileSplitting,
 }
@@ -46,6 +46,8 @@ pub(crate) struct Shard {
     splitting: FileSplitting,
     current_file: Option<ShardFile>,
     header_record: Option<StringRecord>,
+
+    create_file: Option<fn(&Path) -> std::io::Result<Box<dyn Write>>>,
     on_completion: Option<fn(&Path, &str)>,
 }
 
@@ -64,6 +66,7 @@ impl Shard {
 
         extension: &str,
         header: &Option<StringRecord>,
+        create_file: Option<fn(&Path) -> std::io::Result<Box<dyn Write>>>,
         on_completion: Option<fn(&Path, &str)>,
     ) -> Self {
         Self {
@@ -74,6 +77,7 @@ impl Shard {
             directory: directory.to_owned(),
             key,
             sequence: 0,
+            create_file,
             extension: extension.to_owned(),
         }
     }
@@ -97,8 +101,16 @@ impl Shard {
             }
             None => {
                 // Start a new file
-                let mut writer = Writer::from_path(self.path())?;
-                self.sequence += 1;
+                let writer = match self.create_file {
+                    Some(f) => (f)(&self.path())?,
+                    None => {
+                        let writer = std::fs::File::create(self.path())?;
+                        let buf = BufWriter::new(writer);
+                        Box::new(buf)
+                    }
+                };
+
+                let mut writer = Writer::from_writer(writer);
 
                 if let Some(h) = &self.header_record {
                     writer.write_record(h)?;
@@ -111,6 +123,8 @@ impl Shard {
                     written: 0,
                     splitting: self.splitting,
                 };
+
+                self.sequence += 1;
 
                 // This seems an unnecessary step -- but if we only want to write one row or very few bytes to
                 // a stream, we'll preserve this check.
