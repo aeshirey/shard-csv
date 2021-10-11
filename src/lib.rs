@@ -1,20 +1,7 @@
 mod shard;
 mod sharded_writer;
+pub use csv;
 pub use sharded_writer::ShardedWriter;
-
-
-/// Defines how input headers should be handled
-#[derive(Clone, Copy, Debug)]
-pub enum HeaderHandling {
-    /// The input file does not have a header
-    NoHeader,
-
-    /// The input file has a header, but it should not be retained on output
-    RemoveHeader,
-
-    /// The input file has a header, and it should be retained on output
-    KeepHeader,
-}
 
 /// Defines how output files will be split
 #[derive(Clone, Copy, Debug)]

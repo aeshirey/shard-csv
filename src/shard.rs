@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) type CreateFileFunction = fn(&Path) -> std::io::Result<Box<dyn Write>>;
+
 /// Represents an individual file written out.
 struct ShardFile {
     path: PathBuf,
@@ -38,25 +40,51 @@ impl ShardFile {
 
 /// A logical sharded subset of the input data.
 pub(crate) struct Shard {
+    /// The directory into which output files will be written
     directory: PathBuf,
-    key: String,
-    sequence: usize,
-    extension: String,
 
+    /// The shard value
+    key: String,
+
+    /// The current, zero-based number identifying how many files have been
+    /// written for this shard
+    sequence: usize,
+
+    /// How output files will be split up
     splitting: FileSplitting,
+
+    /// A reference to the [ShardFile], if one is open, for outputting rows.
     current_file: Option<ShardFile>,
+
+    /// The optional header row to be written to each sharded file.
     header_record: Option<StringRecord>,
 
-    create_file: Option<fn(&Path) -> std::io::Result<Box<dyn Write>>>,
+    /// A function that creates each output shard.
+    ///
+    /// By default, this will create a buffered text writer, but if you want
+    /// to gzip output, for example, this function overrides that behavior.
+    on_create_file: CreateFileFunction,
+
+    /// A function to be called when each sharded file is complete.
+    ///
+    /// A file is complete when the Shard gets dropped, which is either when
+    /// the [ShardedWriter] is itself dropped or when a new [ShardFile] is
+    /// created for file splitting.
     on_completion: Option<fn(&Path, &str)>,
+
+    /// A function that defines how intermediate shard files are named.
+    ///
+    /// By default, files are named as `{shard}-{sequence}.{extension}`. For
+    /// example, "washington-7.csv" might be created when sharding on US
+    /// state names.
+    ///
+    /// You may over
+    create_output_filename: fn(shard: &str, seq: usize) -> String,
 }
 
 impl Shard {
     fn path(&self) -> std::path::PathBuf {
-        Path::new(&self.directory).join(&format!(
-            "{}-{}.{}",
-            self.key, self.sequence, self.extension
-        ))
+        Path::new(&self.directory).join((self.create_output_filename)(&self.key, self.sequence))
     }
 
     pub fn new(
@@ -64,29 +92,29 @@ impl Shard {
         directory: &Path,
         key: String,
 
-        extension: &str,
-        header: &Option<StringRecord>,
-        create_file: Option<fn(&Path) -> std::io::Result<Box<dyn Write>>>,
+        header_record: Option<StringRecord>,
+        on_create_file: CreateFileFunction,
+        create_output_filename: fn(shard: &str, seq: usize) -> String,
         on_completion: Option<fn(&Path, &str)>,
     ) -> Self {
         Self {
             splitting,
             current_file: None,
-            header_record: header.clone(),
+            header_record,
             on_completion,
             directory: directory.to_owned(),
             key,
             sequence: 0,
-            create_file,
-            extension: extension.to_owned(),
+            create_output_filename,
+            on_create_file,
         }
     }
 
-    pub fn write_record(&mut self, record: StringRecord) -> Result<(), crate::Error> {
+    pub fn write_record(&mut self, record: &StringRecord) -> Result<(), crate::Error> {
         match self.current_file.as_mut() {
             Some(sf) => {
                 // File is already in-progress
-                if sf.write_record(&record)? {
+                if sf.write_record(record)? {
                     // And we should wrap this one up.
                     if let Some(s) = self.current_file.take() {
                         if let Some(callback) = self.on_completion {
@@ -101,15 +129,7 @@ impl Shard {
             }
             None => {
                 // Start a new file
-                let writer = match self.create_file {
-                    Some(f) => (f)(&self.path())?,
-                    None => {
-                        let writer = std::fs::File::create(self.path())?;
-                        let buf = BufWriter::new(writer);
-                        Box::new(buf)
-                    }
-                };
-
+                let writer = (self.on_create_file)(&self.path())?;
                 let mut writer = Writer::from_writer(writer);
 
                 if let Some(h) = &self.header_record {
@@ -128,7 +148,7 @@ impl Shard {
 
                 // This seems an unnecessary step -- but if we only want to write one row or very few bytes to
                 // a stream, we'll preserve this check.
-                if !shard_file.write_record(&record)? {
+                if !shard_file.write_record(record)? {
                     self.current_file = Some(shard_file);
                 }
             }
@@ -153,4 +173,10 @@ impl Drop for Shard {
             }
         }
     }
+}
+
+pub(crate) fn default_on_create_file(path: &Path) -> std::io::Result<Box<dyn Write>> {
+    let writer = std::fs::File::create(path)?;
+    let buf = BufWriter::new(writer);
+    Ok(Box::new(buf))
 }

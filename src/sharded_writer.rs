@@ -1,32 +1,35 @@
-use crate::{shard::Shard, Error, FileSplitting, HeaderHandling};
+use crate::{
+    shard::{self, Shard},
+    Error, FileSplitting,
+};
 use csv::StringRecord;
 use std::{
     collections::{hash_map::Entry, HashMap},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 pub struct ShardedWriter {
-    /// How the header row should be handled
-    header_handling: HeaderHandling,
-
     /// How the input file should be split
     output_splitting: FileSplitting,
 
-    /// The field delimiter; default is '\t'
+    /// The field delimiter; default is ','
     delimiter: u8,
 
     /// A closure that accepts a CSV row and returns a String identifying which shard it belongs to.
     key_selector: fn(&StringRecord) -> String,
 
-    extension: Option<String>,
+    header: Option<StringRecord>,
 
-    on_completion: Option<fn(&Path, &str)>,
+    /// A function that will be called when an intermediate file is completed
+    on_file_completion: Option<fn(&Path, &str)>,
 
-    output_directory: Option<PathBuf>,
+    output_directory: PathBuf,
+
+    create_output_filename: fn(shard: &str, seq: usize) -> String,
 
     /// A closure that creates a writer for a requested output file path
-    create_file: Option<fn(&Path) -> std::io::Result<Box<dyn Write>>>,
+    on_create_file: crate::shard::CreateFileFunction,
 
     handles: HashMap<String, Shard>,
 }
@@ -34,33 +37,72 @@ pub struct ShardedWriter {
 impl std::fmt::Debug for ShardedWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedWriter")
-            .field("header", &self.header_handling)
-            .field("split", &self.output_splitting)
+            .field("output_splitting", &self.output_splitting)
             .field("delimiter", &self.delimiter)
-            .field("extension", &self.extension)
             .finish()
     }
 }
 
 impl ShardedWriter {
-    pub fn new(key_selector: fn(&StringRecord) -> String) -> Self {
-        Self {
-            output_splitting: FileSplitting::NoSplit,
-            header_handling: HeaderHandling::NoHeader,
-            delimiter: b'\t',
-            key_selector,
-            extension: None,
-            on_completion: None,
-            handles: HashMap::new(),
-            create_file: None,
-            output_directory: None,
+    /// Creates a new writer.
+    ///
+    /// You must specify the directory into which the output will be written, a function
+    /// that extracts the shard key from a csv [StringRecord], and how output files will
+    /// be named. The file naming function accepts the shard key and a zero-based number
+    /// indicating how many files have been created for this shard.
+    ///
+    /// This function can return an error if the output directory can't be created.
+    ///
+    /// ```
+    /// let writer = ShardedWriter::new(
+    ///     "./foo-sharded/",
+    ///     |record| record.get(7).unwrap_or("_unknown").to_string(),
+    ///     |shard, seq| format!("{}-file{}.csv", shard, seq)
+    /// )?;
+    /// ```
+    pub fn new<T>(
+        output_directory: T,
+        key_selector: fn(&StringRecord) -> String,
+        name_file: fn(&str, usize) -> String,
+    ) -> Result<Self, Error>
+    where
+        T: Into<PathBuf>,
+    {
+        let output_directory = output_directory.into();
+        if !output_directory.exists() {
+            println!("create dir: {:?}", output_directory);
+            std::fs::create_dir(&output_directory)?;
         }
+
+        Ok(Self {
+            output_splitting: FileSplitting::NoSplit,
+            delimiter: b',',
+            key_selector,
+            on_file_completion: None,
+            handles: HashMap::new(),
+            on_create_file: shard::default_on_create_file,
+            output_directory,
+            create_output_filename: name_file,
+            header: None,
+        })
     }
 
-    /// Specifies how to handle the header row
-    pub fn with_header_handling(mut self, header_handling: HeaderHandling) -> Self {
-        self.header_handling = header_handling;
+    /// Specifies that this writer will emit a header row on output as specified by `header`.
+    pub fn with_header<T>(mut self, header: T) -> Self
+    where
+        T: Into<StringRecord>,
+    {
+        self.header = Some(header.into());
         self
+    }
+
+    /// Specifies that this writer will emit a header row that comes from the `reader`'s header.
+    pub fn with_header_from<T>(mut self, reader: &mut csv::Reader<T>) -> Result<Self, Error>
+    where
+        T: Read,
+    {
+        self.header = Some(reader.headers()?.clone());
+        Ok(self)
     }
 
     /// Specifies how output files should be split.
@@ -69,60 +111,25 @@ impl ShardedWriter {
         self
     }
 
-    /// Explicitly sets the output file extension to use. If no value is set,
-    /// one will be inferred from the delimiter, either the default `\t` or
-    /// one provided by calling [delimiter].
-    ///
-    /// Do not include the leading `.`. For example, use `csv` instead of `.csv`
-    pub fn with_output_extension<T>(mut self, extension: T) -> Self
-    where
-        T: Into<String>,
-    {
-        self.extension = Some(extension.into());
-        self
-    }
-
-    /// Sets the field delimiter to be used for input and output files; default is '\t'.
+    /// Sets the field delimiter to be used for output files; default is '\t'.
     pub fn with_delimiter(mut self, delimiter: u8) -> Self {
         self.delimiter = delimiter;
-
-        if self.extension.is_none() {
-            // No extension is set -- infer it from the filename
-            self.extension = Some(match delimiter {
-                b'\t' => "tsv".to_string(),
-                b',' => "csv".to_string(),
-                _ => "csv".to_string(),
-            });
-        }
-
         self
     }
 
     /// Sets an optional function that will be called when individual files are completed, either
     /// because they have been split by the number of rows or bytes or because processing is
     /// complete and the values are being dropped.
-    pub fn with_on_completion(mut self, f: fn(path: &Path, shard_key: &str)) -> Self {
-        self.on_completion = Some(f);
-        self
-    }
-
-    /// Explicitly sets the directory into which output files will be written.
-    ///
-    /// If this isn't called, the output directory will be derived from the first filename
-    /// passed to [process_file].
-    pub fn with_output_directory<T>(mut self, directory: T) -> Self
-    where
-        T: Into<PathBuf>,
-    {
-        self.output_directory = Some(directory.into());
+    pub fn on_file_completion(mut self, f: fn(path: &Path, shard_key: &str)) -> Self {
+        self.on_file_completion = Some(f);
         self
     }
 
     /// Takes a closure that specifies how to create output files.
     ///
     /// The closure provides the [Path] of the output file to be created.
-    pub fn with_create_file(mut self, f: fn(&Path) -> std::io::Result<Box<dyn Write>>) -> Self {
-        self.create_file = Some(f);
+    pub fn on_create_file(mut self, f: fn(&Path) -> std::io::Result<Box<dyn Write>>) -> Self {
+        self.on_create_file = f;
         self
     }
 
@@ -135,65 +142,72 @@ impl ShardedWriter {
     ///
     /// On success, the number of records written is returned.
     pub fn process_file(&mut self, filename: &str) -> Result<usize, Error> {
-        let directory = match &self.output_directory {
-            Some(d) => d.clone(),
-            None => std::path::Path::new(filename).with_extension(""),
-        };
-
-        if !directory.exists() {
-            std::fs::create_dir(&directory)?;
-        }
-
-        if self.extension.is_none() {
-            self.extension = Some(match self.delimiter {
-                b'\t' => "tsv".to_string(),
-                b',' => "csv".to_string(),
-                _ => "csv".to_string(),
-            });
-        }
-
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(self.delimiter)
-            .has_headers(matches!(
-                self.header_handling,
-                HeaderHandling::RemoveHeader | HeaderHandling::KeepHeader
-            ))
+            .has_headers(self.header.is_some())
             .from_path(filename)?;
 
-        let header_record = match self.header_handling {
-            HeaderHandling::NoHeader => None,
-            HeaderHandling::RemoveHeader => {
-                reader.headers()?;
-                None
-            }
-            HeaderHandling::KeepHeader => Some(reader.headers()?.clone()),
-        };
+        let records = reader.records().filter_map(|r| r.ok());
+        //let records = reader.records().filter_map(|r| r.ok());
+        self.process_iter(records)
+    }
+
+    /// Processes the input reader, creating output files according to the specified key
+    /// selector.
+    ///
+    /// This function will fail if the output directory or an output file can't be created or if a
+    /// row can't be written. It can also fail if it is called multiple times with files that have
+    /// different column counts.
+    ///
+    /// On success, the number of records written is returned.
+    pub fn process_csv<T: std::io::Read>(
+        &mut self,
+        reader: &mut csv::Reader<T>,
+    ) -> Result<usize, Error> {
+        let records = reader.records().filter_map(|r| r.ok());
+
+        self.process_iter(records)
+    }
+
+    pub fn process_reader(&mut self, reader: impl std::io::Read) -> Result<usize, Error> {
+        let mut reader = csv::ReaderBuilder::new()
+            .delimiter(self.delimiter)
+            .has_headers(self.header.is_some())
+            .from_reader(reader);
+
+        let records = reader.records().filter_map(|r| r.ok());
+
+        self.process_iter(records)
+    }
+
+    fn process_iter<T>(&mut self, records: T) -> Result<usize, Error>
+    where
+        T: IntoIterator<Item = StringRecord>,
+    {
+        if !self.output_directory.exists() {
+            std::fs::create_dir(&self.output_directory)?;
+        }
 
         let mut records_written = 0;
-        for record in reader.records() {
-            let record = match record {
-                Ok(r) => r,
-                Err(_) => continue, // skip invalid records?
-            };
-
+        for record in records {
             let key = (self.key_selector)(&record);
 
             match self.handles.entry(key.clone()) {
                 Entry::Occupied(mut e) => {
-                    e.get_mut().write_record(record)?;
+                    e.get_mut().write_record(&record)?;
                 }
                 Entry::Vacant(e) => {
                     let mut shard = Shard::new(
                         self.output_splitting,
-                        &directory,
+                        &self.output_directory,
                         key,
-                        &self.extension.as_ref().unwrap(),
-                        &header_record,
-                        self.create_file,
-                        self.on_completion,
+                        self.header.clone(),
+                        self.on_create_file,
+                        self.create_output_filename,
+                        self.on_file_completion,
                     );
 
-                    shard.write_record(record)?;
+                    shard.write_record(&record)?;
 
                     e.insert(shard);
                 }
@@ -205,81 +219,8 @@ impl ShardedWriter {
         Ok(records_written)
     }
 
-    /// Processes the input reader, creating output files according to the specified key
-    /// selector.
-    ///
-    /// This function will fail if the output directory or an output file can't be created or if a
-    /// row can't be written. It can also fail if it is called multiple times with files that have
-    /// different column counts.
-    ///
-    /// On success, the number of records written is returned.
-    pub fn process_reader(
-        &mut self,
-        reader: impl std::io::Read,
-        directory: &Path,
-    ) -> Result<usize, Error> {
-        if !directory.exists() {
-            std::fs::create_dir(&directory)?;
-        }
-
-        if self.extension.is_none() {
-            self.extension = Some(match self.delimiter {
-                b'\t' => "tsv".to_string(),
-                b',' => "csv".to_string(),
-                _ => "csv".to_string(),
-            });
-        }
-
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(self.delimiter)
-            .has_headers(matches!(
-                self.header_handling,
-                HeaderHandling::RemoveHeader | HeaderHandling::KeepHeader
-            ))
-            .from_reader(reader);
-
-        let header_record = match self.header_handling {
-            HeaderHandling::NoHeader => None,
-            HeaderHandling::RemoveHeader => {
-                reader.headers()?;
-                None
-            }
-            HeaderHandling::KeepHeader => Some(reader.headers()?.clone()),
-        };
-
-        let mut records_written = 0;
-        for record in reader.records() {
-            let record = match record {
-                Ok(r) => r,
-                Err(_) => continue, // skip invalid records?
-            };
-
-            let key = (self.key_selector)(&record);
-
-            match self.handles.entry(key.clone()) {
-                Entry::Occupied(mut e) => {
-                    e.get_mut().write_record(record)?;
-                }
-                Entry::Vacant(e) => {
-                    let mut shard = Shard::new(
-                        self.output_splitting,
-                        &directory,
-                        key,
-                        &self.extension.as_ref().unwrap(),
-                        &header_record,
-                        self.create_file,
-                        self.on_completion,
-                    );
-
-                    shard.write_record(record)?;
-
-                    e.insert(shard);
-                }
-            };
-
-            records_written += 1;
-        }
-
-        Ok(records_written)
+    /// Checks if `key` has been seen in the processed data
+    pub fn has_seen_shard_key(&self, key: &str) -> bool {
+        self.handles.contains_key(key)
     }
 }
