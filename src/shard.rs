@@ -3,9 +3,10 @@ use csv::{StringRecord, Writer};
 use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
-pub(crate) type CreateFileFunction = fn(&Path) -> std::io::Result<Box<dyn Write>>;
+pub(crate) type CreateFileWriter = fn(&Path) -> std::io::Result<Box<dyn Write>>;
 
 /// Represents an individual file written out.
 struct ShardFile {
@@ -39,10 +40,10 @@ impl ShardFile {
 }
 
 /// A logical sharded subset of the input data.
-pub(crate) struct Shard {
-    /// The directory into which output files will be written
-    directory: PathBuf,
-
+pub(crate) struct Shard<FNameFile>
+where
+    FNameFile: Fn(&str, usize) -> PathBuf,
+{
     /// The shard value
     key: String,
 
@@ -63,14 +64,14 @@ pub(crate) struct Shard {
     ///
     /// By default, this will create a buffered text writer, but if you want
     /// to gzip output, for example, this function overrides that behavior.
-    on_create_file: CreateFileFunction,
+    create_file_writer: CreateFileWriter,
 
     /// A function to be called when each sharded file is complete.
     ///
     /// A file is complete when the Shard gets dropped, which is either when
     /// the [ShardedWriter] is itself dropped or when a new [ShardFile] is
     /// created for file splitting.
-    on_completion: Option<fn(&Path, &str)>,
+    on_file_completion: Option<fn(&Path, &str)>,
 
     /// A function that defines how intermediate shard files are named.
     ///
@@ -79,34 +80,36 @@ pub(crate) struct Shard {
     /// state names.
     ///
     /// You may over
-    create_output_filename: fn(shard: &str, seq: usize) -> String,
+    //create_output_filename: fn(shard: &str, seq: usize) -> String,
+    create_output_filename: Rc<FNameFile>,
 }
 
-impl Shard {
+impl<FNameFile> Shard<FNameFile>
+where
+    FNameFile: Fn(&str, usize) -> PathBuf,
+{
     fn path(&self) -> std::path::PathBuf {
-        Path::new(&self.directory).join((self.create_output_filename)(&self.key, self.sequence))
+        (self.create_output_filename)(&self.key, self.sequence)
     }
 
     pub fn new(
         splitting: FileSplitting,
-        directory: &Path,
         key: String,
 
         header_record: Option<StringRecord>,
-        on_create_file: CreateFileFunction,
-        create_output_filename: fn(shard: &str, seq: usize) -> String,
-        on_completion: Option<fn(&Path, &str)>,
+        create_file_writer: CreateFileWriter,
+        create_output_filename: Rc<FNameFile>,
+        on_file_completion: Option<fn(&Path, &str)>,
     ) -> Self {
         Self {
             splitting,
             current_file: None,
             header_record,
-            on_completion,
-            directory: directory.to_owned(),
+            on_file_completion,
             key,
             sequence: 0,
             create_output_filename,
-            on_create_file,
+            create_file_writer,
         }
     }
 
@@ -117,7 +120,7 @@ impl Shard {
                 if sf.write_record(record)? {
                     // And we should wrap this one up.
                     if let Some(s) = self.current_file.take() {
-                        if let Some(callback) = self.on_completion {
+                        if let Some(callback) = &self.on_file_completion {
                             let ShardFile {
                                 path, key, writer, ..
                             } = s;
@@ -129,7 +132,7 @@ impl Shard {
             }
             None => {
                 // Start a new file
-                let writer = (self.on_create_file)(&self.path())?;
+                let writer = (self.create_file_writer)(&self.path())?;
                 let mut writer = Writer::from_writer(writer);
 
                 if let Some(h) = &self.header_record {
@@ -158,13 +161,16 @@ impl Shard {
     }
 }
 
-impl Drop for Shard {
+impl<FNameFile> Drop for Shard<FNameFile>
+where
+    FNameFile: Fn(&str, usize) -> PathBuf,
+{
     fn drop(&mut self) {
         if let Some(ShardFile {
             path, key, writer, ..
         }) = self.current_file.take()
         {
-            if let Some(callback) = self.on_completion {
+            if let Some(callback) = &self.on_file_completion {
                 // Explicitly drop the writer so the file gets flushed an the handle closed.
                 drop(writer);
 
@@ -175,7 +181,7 @@ impl Drop for Shard {
     }
 }
 
-pub(crate) fn default_on_create_file(path: &Path) -> std::io::Result<Box<dyn Write>> {
+pub(crate) fn default_create_file_writer(path: &Path) -> std::io::Result<Box<dyn Write>> {
     let writer = std::fs::File::create(path)?;
     let buf = BufWriter::new(writer);
     Ok(Box::new(buf))

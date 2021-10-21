@@ -7,9 +7,13 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     io::{Read, Write},
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
-pub struct ShardedWriter {
+pub struct ShardedWriter<FKey, FNameFile>
+where
+    FNameFile: Fn(&str, usize) -> PathBuf,
+{
     /// How the input file should be split
     output_splitting: FileSplitting,
 
@@ -17,24 +21,27 @@ pub struct ShardedWriter {
     delimiter: u8,
 
     /// A closure that accepts a CSV row and returns a String identifying which shard it belongs to.
-    key_selector: fn(&StringRecord) -> String,
+    key_selector: FKey,
 
+    /// An optional header record that will be written to every output file.
     header: Option<StringRecord>,
 
     /// A function that will be called when an intermediate file is completed
     on_file_completion: Option<fn(&Path, &str)>,
 
-    output_directory: PathBuf,
+    create_output_filename: Rc<FNameFile>,
 
-    create_output_filename: fn(shard: &str, seq: usize) -> String,
+    /// A function that creates a writer for a requested output file path
+    create_file_writer: crate::shard::CreateFileWriter,
 
-    /// A closure that creates a writer for a requested output file path
-    on_create_file: crate::shard::CreateFileFunction,
-
-    handles: HashMap<String, Shard>,
+    /// A mapping of shard keys to the shards that output to files
+    handles: HashMap<String, Shard<FNameFile>>,
 }
 
-impl std::fmt::Debug for ShardedWriter {
+impl<FKey, FNameFile> std::fmt::Debug for ShardedWriter<FKey, FNameFile>
+where
+    FNameFile: Fn(&str, usize) -> PathBuf,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedWriter")
             .field("output_splitting", &self.output_splitting)
@@ -43,7 +50,11 @@ impl std::fmt::Debug for ShardedWriter {
     }
 }
 
-impl ShardedWriter {
+impl<FKey, FNameFile> ShardedWriter<FKey, FNameFile>
+where
+    FKey: Fn(&StringRecord) -> String,
+    FNameFile: Fn(&str, usize) -> PathBuf,
+{
     /// Creates a new writer.
     ///
     /// You must specify the directory into which the output will be written, a function
@@ -60,30 +71,66 @@ impl ShardedWriter {
     ///     |shard, seq| format!("{}-file{}.csv", shard, seq)
     /// )?;
     /// ```
-    pub fn new<T>(
-        output_directory: T,
-        key_selector: fn(&StringRecord) -> String,
-        name_file: fn(&str, usize) -> String,
-    ) -> Result<Self, Error>
-    where
-        T: Into<PathBuf>,
-    {
-        let output_directory = output_directory.into();
-        if !output_directory.exists() {
-            println!("create dir: {:?}", output_directory);
-            std::fs::create_dir(&output_directory)?;
-        }
-
+    pub fn new_without_header(
+        key_selector: FKey,
+        create_output_filename: FNameFile,
+    ) -> Result<Self, Error> {
         Ok(Self {
             output_splitting: FileSplitting::NoSplit,
             delimiter: b',',
             key_selector,
             on_file_completion: None,
             handles: HashMap::new(),
-            on_create_file: shard::default_on_create_file,
-            output_directory,
-            create_output_filename: name_file,
+            create_file_writer: shard::default_create_file_writer,
+            create_output_filename: Rc::new(create_output_filename),
             header: None,
+        })
+    }
+
+    pub fn new_with_header<T>(
+        header: T,
+        key_selector: FKey,
+        name_file: FNameFile,
+    ) -> Result<Self, Error>
+    where
+        T: Into<StringRecord>,
+    {
+        Ok(Self {
+            output_splitting: FileSplitting::NoSplit,
+            delimiter: b',',
+            key_selector,
+            on_file_completion: None,
+            handles: HashMap::new(),
+            create_file_writer: shard::default_create_file_writer,
+            create_output_filename: Rc::new(name_file),
+            header: Some(header.into()),
+        })
+    }
+
+    pub fn new_from_csv_reader<T>(
+        csv: &mut csv::Reader<T>,
+        key_selector: FKey,
+        name_file: FNameFile,
+    ) -> Result<Self, Error>
+    where
+        T: std::io::Read,
+    {
+        let header = if csv.has_headers() {
+            Some(csv.headers()?.clone())
+        } else {
+            None
+        };
+
+        //todo!()
+        Ok(Self {
+            output_splitting: FileSplitting::NoSplit,
+            delimiter: b',',
+            key_selector,
+            on_file_completion: None,
+            handles: HashMap::new(),
+            create_file_writer: shard::default_create_file_writer,
+            create_output_filename: Rc::new(name_file),
+            header,
         })
     }
 
@@ -120,7 +167,7 @@ impl ShardedWriter {
     /// Sets an optional function that will be called when individual files are completed, either
     /// because they have been split by the number of rows or bytes or because processing is
     /// complete and the values are being dropped.
-    pub fn on_file_completion(mut self, f: fn(path: &Path, shard_key: &str)) -> Self {
+    pub fn on_file_completion(mut self, f: fn(&Path, &str)) -> Self {
         self.on_file_completion = Some(f);
         self
     }
@@ -129,7 +176,7 @@ impl ShardedWriter {
     ///
     /// The closure provides the [Path] of the output file to be created.
     pub fn on_create_file(mut self, f: fn(&Path) -> std::io::Result<Box<dyn Write>>) -> Self {
-        self.on_create_file = f;
+        self.create_file_writer = f;
         self
     }
 
@@ -152,8 +199,7 @@ impl ShardedWriter {
         self.process_iter(records)
     }
 
-    /// Processes the input reader, creating output files according to the specified key
-    /// selector.
+    /// Processes the input reader, creating output files as appropriate.
     ///
     /// This function will fail if the output directory or an output file can't be created or if a
     /// row can't be written. It can also fail if it is called multiple times with files that have
@@ -162,13 +208,16 @@ impl ShardedWriter {
     /// On success, the number of records written is returned.
     pub fn process_csv<T: std::io::Read>(
         &mut self,
-        reader: &mut csv::Reader<T>,
+        csv_reader: &mut csv::Reader<T>,
     ) -> Result<usize, Error> {
-        let records = reader.records().filter_map(|r| r.ok());
+        let records = csv_reader.records().filter_map(|r| r.ok());
 
         self.process_iter(records)
     }
 
+    /// Processes an iterator of [std::io::Read], creating output files as appropriate.
+    ///
+    ///
     pub fn process_reader(&mut self, reader: impl std::io::Read) -> Result<usize, Error> {
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(self.delimiter)
@@ -184,10 +233,6 @@ impl ShardedWriter {
     where
         T: IntoIterator<Item = StringRecord>,
     {
-        if !self.output_directory.exists() {
-            std::fs::create_dir(&self.output_directory)?;
-        }
-
         let mut records_written = 0;
         for record in records {
             let key = (self.key_selector)(&record);
@@ -199,16 +244,14 @@ impl ShardedWriter {
                 Entry::Vacant(e) => {
                     let mut shard = Shard::new(
                         self.output_splitting,
-                        &self.output_directory,
                         key,
                         self.header.clone(),
-                        self.on_create_file,
-                        self.create_output_filename,
+                        self.create_file_writer,
+                        self.create_output_filename.clone(),
                         self.on_file_completion,
                     );
 
                     shard.write_record(&record)?;
-
                     e.insert(shard);
                 }
             };
