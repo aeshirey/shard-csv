@@ -5,20 +5,99 @@ use crate::{
 use csv::StringRecord;
 use std::{
     collections::{hash_map::Entry, HashMap},
-    io::{Read, Write},
-    path::{Path, PathBuf},
+    io::Write,
+    path::Path,
     rc::Rc,
 };
 
+pub struct ShardedWriterBuilder {
+    header: Option<StringRecord>,
+}
+
+impl ShardedWriterBuilder {
+    pub fn new_without_header() -> Self {
+        ShardedWriterBuilder { header: None }
+    }
+
+    pub fn new_with_header<T>(header: T) -> Self
+    where
+        T: Into<StringRecord>,
+    {
+        ShardedWriterBuilder {
+            header: Some(header.into()),
+        }
+    }
+
+    pub fn new_from_csv_reader<T>(csv: &mut csv::Reader<T>) -> Result<Self, Error>
+    where
+        T: std::io::Read,
+    {
+        let header = if csv.has_headers() {
+            Some(csv.headers()?.clone())
+        } else {
+            None
+        };
+
+        Ok(Self { header })
+    }
+
+    /// Specifies how the input will be sharded.
+    ///
+    /// Given a row of input, the key selector determines which shard the record belongs in.
+    pub fn with_key_selector<FKey>(self, key_selector: FKey) -> ShardedWriterWithKey<FKey>
+    where
+        FKey: Fn(&StringRecord) -> String,
+    {
+        ShardedWriterWithKey {
+            header: self.header,
+            key_selector,
+        }
+    }
+}
+
+pub struct ShardedWriterWithKey<FKey> {
+    header: Option<StringRecord>,
+    key_selector: FKey,
+}
+
+impl<FKey> ShardedWriterWithKey<FKey>
+where
+    FKey: Fn(&StringRecord) -> String,
+{
+    pub fn output_shard_naming<FNameFile>(
+        self,
+        create_output_filename: FNameFile,
+    ) -> ShardedWriter<FKey, FNameFile>
+    where
+        FNameFile: Fn(&str, usize) -> String,
+    {
+        let ShardedWriterWithKey {
+            header,
+            key_selector,
+        } = self;
+
+        ShardedWriter {
+            header,
+            key_selector,
+            output_splitting: FileSplitting::NoSplit,
+            output_delimiter: b',',
+            on_file_completion: None,
+            create_file_writer: shard::default_create_file_writer,
+            create_output_filename: Rc::new(create_output_filename),
+            handles: HashMap::new(),
+        }
+    }
+}
+
 pub struct ShardedWriter<FKey, FNameFile>
 where
-    FNameFile: Fn(&str, usize) -> PathBuf,
+    FNameFile: Fn(&str, usize) -> String,
 {
     /// How the input file should be split
     output_splitting: FileSplitting,
 
     /// The field delimiter; default is ','
-    delimiter: u8,
+    output_delimiter: u8,
 
     /// A closure that accepts a CSV row and returns a String identifying which shard it belongs to.
     key_selector: FKey,
@@ -40,12 +119,12 @@ where
 
 impl<FKey, FNameFile> std::fmt::Debug for ShardedWriter<FKey, FNameFile>
 where
-    FNameFile: Fn(&str, usize) -> PathBuf,
+    FNameFile: Fn(&str, usize) -> String,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedWriter")
             .field("output_splitting", &self.output_splitting)
-            .field("delimiter", &self.delimiter)
+            .field("delimiter", &self.output_delimiter)
             .finish()
     }
 }
@@ -53,7 +132,7 @@ where
 impl<FKey, FNameFile> ShardedWriter<FKey, FNameFile>
 where
     FKey: Fn(&StringRecord) -> String,
-    FNameFile: Fn(&str, usize) -> PathBuf,
+    FNameFile: Fn(&str, usize) -> String,
 {
     /// Creates a new writer.
     ///
@@ -71,86 +150,6 @@ where
     ///     |shard, seq| format!("{}-file{}.csv", shard, seq)
     /// )?;
     /// ```
-    pub fn new_without_header(
-        key_selector: FKey,
-        create_output_filename: FNameFile,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            output_splitting: FileSplitting::NoSplit,
-            delimiter: b',',
-            key_selector,
-            on_file_completion: None,
-            handles: HashMap::new(),
-            create_file_writer: shard::default_create_file_writer,
-            create_output_filename: Rc::new(create_output_filename),
-            header: None,
-        })
-    }
-
-    pub fn new_with_header<T>(
-        header: T,
-        key_selector: FKey,
-        name_file: FNameFile,
-    ) -> Result<Self, Error>
-    where
-        T: Into<StringRecord>,
-    {
-        Ok(Self {
-            output_splitting: FileSplitting::NoSplit,
-            delimiter: b',',
-            key_selector,
-            on_file_completion: None,
-            handles: HashMap::new(),
-            create_file_writer: shard::default_create_file_writer,
-            create_output_filename: Rc::new(name_file),
-            header: Some(header.into()),
-        })
-    }
-
-    pub fn new_from_csv_reader<T>(
-        csv: &mut csv::Reader<T>,
-        key_selector: FKey,
-        name_file: FNameFile,
-    ) -> Result<Self, Error>
-    where
-        T: std::io::Read,
-    {
-        let header = if csv.has_headers() {
-            Some(csv.headers()?.clone())
-        } else {
-            None
-        };
-
-        //todo!()
-        Ok(Self {
-            output_splitting: FileSplitting::NoSplit,
-            delimiter: b',',
-            key_selector,
-            on_file_completion: None,
-            handles: HashMap::new(),
-            create_file_writer: shard::default_create_file_writer,
-            create_output_filename: Rc::new(name_file),
-            header,
-        })
-    }
-
-    /// Specifies that this writer will emit a header row on output as specified by `header`.
-    pub fn with_header<T>(mut self, header: T) -> Self
-    where
-        T: Into<StringRecord>,
-    {
-        self.header = Some(header.into());
-        self
-    }
-
-    /// Specifies that this writer will emit a header row that comes from the `reader`'s header.
-    pub fn with_header_from<T>(mut self, reader: &mut csv::Reader<T>) -> Result<Self, Error>
-    where
-        T: Read,
-    {
-        self.header = Some(reader.headers()?.clone());
-        Ok(self)
-    }
 
     /// Specifies how output files should be split.
     pub fn with_output_splitting(mut self, output_splitting: FileSplitting) -> Self {
@@ -160,7 +159,7 @@ where
 
     /// Sets the field delimiter to be used for output files; default is '\t'.
     pub fn with_delimiter(mut self, delimiter: u8) -> Self {
-        self.delimiter = delimiter;
+        self.output_delimiter = delimiter;
         self
     }
 
@@ -190,7 +189,7 @@ where
     /// On success, the number of records written is returned.
     pub fn process_file(&mut self, filename: &str) -> Result<usize, Error> {
         let mut reader = csv::ReaderBuilder::new()
-            .delimiter(self.delimiter)
+            .delimiter(self.output_delimiter)
             .has_headers(self.header.is_some())
             .from_path(filename)?;
 
@@ -220,7 +219,7 @@ where
     ///
     pub fn process_reader(&mut self, reader: impl std::io::Read) -> Result<usize, Error> {
         let mut reader = csv::ReaderBuilder::new()
-            .delimiter(self.delimiter)
+            .delimiter(self.output_delimiter)
             .has_headers(self.header.is_some())
             .from_reader(reader);
 

@@ -42,7 +42,7 @@ impl ShardFile {
 /// A logical sharded subset of the input data.
 pub(crate) struct Shard<FNameFile>
 where
-    FNameFile: Fn(&str, usize) -> PathBuf,
+    FNameFile: Fn(&str, usize) -> String,
 {
     /// The shard value
     key: String,
@@ -86,10 +86,10 @@ where
 
 impl<FNameFile> Shard<FNameFile>
 where
-    FNameFile: Fn(&str, usize) -> PathBuf,
+    FNameFile: Fn(&str, usize) -> String,
 {
     fn path(&self) -> std::path::PathBuf {
-        (self.create_output_filename)(&self.key, self.sequence)
+        (self.create_output_filename)(&self.key, self.sequence).into()
     }
 
     pub fn new(
@@ -163,7 +163,7 @@ where
 
 impl<FNameFile> Drop for Shard<FNameFile>
 where
-    FNameFile: Fn(&str, usize) -> PathBuf,
+    FNameFile: Fn(&str, usize) -> String,
 {
     fn drop(&mut self) {
         if let Some(ShardFile {

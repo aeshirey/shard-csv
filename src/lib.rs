@@ -1,7 +1,7 @@
 mod shard;
 mod sharded_writer;
 pub use csv;
-pub use sharded_writer::ShardedWriter;
+pub use sharded_writer::*;
 
 /// Defines how output files will be split
 #[derive(Clone, Copy, Debug)]
