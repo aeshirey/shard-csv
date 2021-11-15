@@ -1,7 +1,7 @@
 use crate::{Error, FileSplitting};
 use csv::{StringRecord, Writer};
 use std::{
-    io::{BufWriter, Write},
+    io::Write,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -171,18 +171,12 @@ where
         }) = self.current_file.take()
         {
             if let Some(callback) = &self.on_file_completion {
-                // Explicitly drop the writer so the file gets flushed an the handle closed.
+                // Explicitly drop the writer so the file gets flushed and the handle closed.
                 drop(writer);
 
-                // *Then* call back to the client
+                // *Then* call back to the client because now the file is definitely dropped.
                 callback(&path, &key);
             }
         }
     }
-}
-
-pub(crate) fn default_create_file_writer(path: &Path) -> std::io::Result<Box<dyn Write>> {
-    let writer = std::fs::File::create(path)?;
-    let buf = BufWriter::new(writer);
-    Ok(Box::new(buf))
 }

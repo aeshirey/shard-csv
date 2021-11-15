@@ -1,11 +1,8 @@
-use crate::{
-    shard::{self, Shard},
-    Error, FileSplitting,
-};
+use crate::{shard, Error, FileSplitting};
 use csv::StringRecord;
 use std::{
     collections::{hash_map::Entry, HashMap},
-    io::Write,
+    io::{BufWriter, Write},
     path::Path,
     rc::Rc,
 };
@@ -15,10 +12,12 @@ pub struct ShardedWriterBuilder {
 }
 
 impl ShardedWriterBuilder {
+    /// Start creating a sharded writer for data that don't have a header.
     pub fn new_without_header() -> Self {
         ShardedWriterBuilder { header: None }
     }
 
+    /// Start creating a sharded writer for data with the specified `header`.
     pub fn new_with_header<T>(header: T) -> Self
     where
         T: Into<StringRecord>,
@@ -28,6 +27,9 @@ impl ShardedWriterBuilder {
         }
     }
 
+    /// Start creating a sharded writer from the specified [`csv::Reader`]
+    ///
+    /// The reader's header settings will be copied over to the sharded writer.
     pub fn new_from_csv_reader<T>(csv: &mut csv::Reader<T>) -> Result<Self, Error>
     where
         T: std::io::Read,
@@ -64,7 +66,12 @@ impl<FKey> ShardedWriterWithKey<FKey>
 where
     FKey: Fn(&StringRecord) -> String,
 {
-    pub fn output_shard_naming<FNameFile>(
+    /// Specifies how output shard files will be named.
+    ///
+    /// The specified function will be called with the key value (derived from the `key_selector`
+    /// passed to [`ShardedWriterBuilder::with_key_selector`]) and the current sequence number,
+    /// which is a zero-based number identifying how many files have been written for this shard.
+    pub fn with_output_shard_naming<FNameFile>(
         self,
         create_output_filename: FNameFile,
     ) -> ShardedWriter<FKey, FNameFile>
@@ -77,12 +84,12 @@ where
         } = self;
 
         ShardedWriter {
-            header,
+            header_record: header,
             key_selector,
             output_splitting: FileSplitting::NoSplit,
             output_delimiter: b',',
             on_file_completion: None,
-            create_file_writer: shard::default_create_file_writer,
+            create_file_writer: default_create_file_writer,
             create_output_filename: Rc::new(create_output_filename),
             handles: HashMap::new(),
         }
@@ -103,7 +110,7 @@ where
     key_selector: FKey,
 
     /// An optional header record that will be written to every output file.
-    header: Option<StringRecord>,
+    header_record: Option<StringRecord>,
 
     /// A function that will be called when an intermediate file is completed
     on_file_completion: Option<fn(&Path, &str)>,
@@ -114,7 +121,7 @@ where
     create_file_writer: crate::shard::CreateFileWriter,
 
     /// A mapping of shard keys to the shards that output to files
-    handles: HashMap<String, Shard<FNameFile>>,
+    handles: HashMap<String, shard::Shard<FNameFile>>,
 }
 
 impl<FKey, FNameFile> std::fmt::Debug for ShardedWriter<FKey, FNameFile>
@@ -151,13 +158,13 @@ where
     /// )?;
     /// ```
 
-    /// Specifies how output files should be split.
+    /// Specifies when sharded output files should be split.
     pub fn with_output_splitting(mut self, output_splitting: FileSplitting) -> Self {
         self.output_splitting = output_splitting;
         self
     }
 
-    /// Sets the field delimiter to be used for output files; default is '\t'.
+    /// Sets the field delimiter to be used for output files. Default is ','.
     pub fn with_delimiter(mut self, delimiter: u8) -> Self {
         self.output_delimiter = delimiter;
         self
@@ -173,7 +180,16 @@ where
 
     /// Takes a closure that specifies how to create output files.
     ///
-    /// The closure provides the [Path] of the output file to be created.
+    /// The closure provides the [Path] of the output file to be created. If you don't
+    /// provide your own way to create output files, the default implementation will simply create
+    /// a new [BufWriter] for the output file, which is the same as:
+    ///
+    /// ```
+    /// my_sharded_writer.on_create_file(|path| Ok(BufWriter::new(File::create(path)?)));
+    /// ```
+    ///
+    /// This function may be useful if, for example, you want to inject gzip compression into the
+    /// output writer.
     pub fn on_create_file(mut self, f: fn(&Path) -> std::io::Result<Box<dyn Write>>) -> Self {
         self.create_file_writer = f;
         self
@@ -190,11 +206,10 @@ where
     pub fn process_file(&mut self, filename: &str) -> Result<usize, Error> {
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(self.output_delimiter)
-            .has_headers(self.header.is_some())
+            .has_headers(self.header_record.is_some())
             .from_path(filename)?;
 
         let records = reader.records().filter_map(|r| r.ok());
-        //let records = reader.records().filter_map(|r| r.ok());
         self.process_iter(records)
     }
 
@@ -215,12 +230,10 @@ where
     }
 
     /// Processes an iterator of [std::io::Read], creating output files as appropriate.
-    ///
-    ///
     pub fn process_reader(&mut self, reader: impl std::io::Read) -> Result<usize, Error> {
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(self.output_delimiter)
-            .has_headers(self.header.is_some())
+            .has_headers(self.header_record.is_some())
             .from_reader(reader);
 
         let records = reader.records().filter_map(|r| r.ok());
@@ -228,7 +241,9 @@ where
         self.process_iter(records)
     }
 
-    fn process_iter<T>(&mut self, records: T) -> Result<usize, Error>
+    /// Iterates over every record, calculating the shard key for each, getting or creating the shard file,
+    /// and writing the record.
+    pub fn process_iter<T>(&mut self, records: T) -> Result<usize, Error>
     where
         T: IntoIterator<Item = StringRecord>,
     {
@@ -241,12 +256,14 @@ where
                     e.get_mut().write_record(&record)?;
                 }
                 Entry::Vacant(e) => {
-                    let mut shard = Shard::new(
+                    let header_record = self.header_record.clone();
+                    let create_output_filename = self.create_output_filename.clone();
+                    let mut shard = shard::Shard::new(
                         self.output_splitting,
                         key,
-                        self.header.clone(),
+                        header_record,
                         self.create_file_writer,
-                        self.create_output_filename.clone(),
+                        create_output_filename,
                         self.on_file_completion,
                     );
 
@@ -261,8 +278,23 @@ where
         Ok(records_written)
     }
 
-    /// Checks if `key` has been seen in the processed data
-    pub fn has_seen_shard_key(&self, key: &str) -> bool {
+    /// Checks if `key` has been seen in the processed data.
+    pub fn is_shard_key_seen(&self, key: &str) -> bool {
         self.handles.contains_key(key)
     }
+
+    /// Returns a vec of all keys that have been seen.
+    pub fn shard_keys_seen(&self) -> Vec<String> {
+        self.handles.keys().cloned().collect()
+    }
+}
+
+/// The standard approach to creating a file writer -- create and buffer it.
+///
+/// To do something different (such as gzipping output), [ShardedWriter::on_create_file]
+/// is passed an alternate function with this signature.
+fn default_create_file_writer(path: &Path) -> std::io::Result<Box<dyn Write>> {
+    let writer = std::fs::File::create(path)?;
+    let buf = BufWriter::new(writer);
+    Ok(Box::new(buf))
 }
