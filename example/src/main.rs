@@ -12,10 +12,10 @@ fn main() {
     let mut writer = ShardedWriterBuilder::new_from_csv_reader(&mut reader)
         .expect("Failed to create writer")
         .with_key_selector(|row| row.get(2).unwrap_or("language_unknown").to_string())
-        .with_output_shard_naming(|key, seq| format!("data_lang={}.part{}.csv", key, seq))
+        .with_output_shard_naming(|key, seq| format!("data_lang={key}.part{seq}.csv"))
         .with_output_splitting(FileSplitting::SplitAfterBytes(1024 * 1024))
         .on_file_completion(|path, key| {
-            println!("The file {} is now ready for shard {}", path.display(), key);
+            println!("The file {} is now ready for shard {key}", path.display());
             // Upload the file to our remote server or something.
         });
 

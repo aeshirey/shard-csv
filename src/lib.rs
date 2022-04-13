@@ -23,7 +23,7 @@
 //!
 //! Several functions make use of the `csv::Reader` type, but you can write data without
 //! it provided each row is converted to a `StringRecord`:
-//! 
+//!
 //! ```
 //! let data = vec![
 //!     ["john", "smith", "123 main st"],
@@ -32,7 +32,7 @@
 //! let it = data.iter().map(|r| StringRecord::from(&r[..]));
 //! shard_writer.process_iter(it).ok();
 //! ```
-//! 
+//!
 //! # Usage
 //! A `ShardedWriter` must know about the header row. This can be accomplished by one of
 //! three functions:
@@ -72,7 +72,7 @@
 //! let mut shard_writer = ShardedWriterBuilder::new_from_csv_reader(&mut csv_reader)
 //!    .expect("Failed to create writer builder");
 //!    .with_key_selector(|rec| rec.get(0).unwrap_or("unknown").to_owned());
-//!    .with_output_shard_naming(|shard, seq| format!("{}-{}.csv", shard, seq));
+//!    .with_output_shard_naming(|shard, seq| format!("{shard}-{seq}.csv"));
 //! ```
 //!
 //! At this point, you can pass iterators of records (likely just the `csv_reader` itself)
@@ -99,7 +99,7 @@
 //!
 //! ```
 //! shard_writer = shard_writer.on_file_completion(|path, key| {
-//!     println!("Output file '{}' for key '{}' is complete", path.display(), key);
+//!     println!("Output file '{}' for key '{key}' is complete", path.display());
 //! });
 //! ```
 //!
@@ -117,6 +117,7 @@
 //! ```
 mod shard;
 mod sharded_writer;
+
 pub use csv;
 pub use sharded_writer::*;
 
@@ -131,6 +132,12 @@ pub enum FileSplitting {
 
     /// Output files will be split after at least some number of bytes are written
     SplitAfterBytes(usize),
+}
+
+impl Default for FileSplitting {
+    fn default() -> Self {
+        FileSplitting::NoSplit
+    }
 }
 
 #[derive(Debug)]

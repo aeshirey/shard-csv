@@ -154,7 +154,7 @@ where
     /// let writer = ShardedWriter::new(
     ///     "./foo-sharded/",
     ///     |record| record.get(7).unwrap_or("_unknown").to_string(),
-    ///     |shard, seq| format!("{}-file{}.csv", shard, seq)
+    ///     |shard, seq| format!("{shard}-file{seq}.csv")
     /// )?;
     /// ```
 

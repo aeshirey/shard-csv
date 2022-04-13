@@ -79,8 +79,14 @@ where
     /// example, "washington-7.csv" might be created when sharding on US
     /// state names.
     ///
-    /// You may over
-    //create_output_filename: fn(shard: &str, seq: usize) -> String,
+    /// You may override this with [`.with_output_shard_naming`]:
+    /// 
+    /// ```
+    /// let mut shard_writer = ShardedWriterBuilder::new_from_csv_reader(&mut csv_reader)
+    ///    .expect("Failed to create writer builder");
+    ///    .with_key_selector(|rec| rec.get(0).unwrap_or("unknown").to_owned());
+    ///    .with_output_shard_naming(|shard, seq| format!("{shard}-{seq}.csv"));
+    /// ```
     create_output_filename: Rc<FNameFile>,
 }
 

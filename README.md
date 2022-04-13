@@ -4,7 +4,7 @@
 ## Usage
 Include it in your Cargo.toml with: `shard-csv = "0.1.0"`.
 
-Sample usage first entails creating a CSV reader. Note that `shard-csv` depends heavily upon the [`csv` crate](https://crates.io/crates/csv), which it, in fact, uses and re-exports:
+Sample usage first entails creating a CSV reader. Note that `shard-csv` depends heavily upon the [`csv` crate](https://crates.io/crates/csv), which it re-exports:
 
 ```rust
 let mut reader = shard_csv::csv::ReaderBuilder::new()
@@ -21,12 +21,16 @@ Then you can create a sharded CSV writer that:
 ```rust
 let mut writer = ShardedWriterBuilder::new_from_csv_reader(&mut reader)
     .expect("Failed to create writer")
+    // treat the third column (index=2) as the key column
     .with_key_selector(|row| row.get(2).unwrap_or("unknown").to_string())
-    .with_output_shard_naming(|key, seq| format!("data.part{}.csv", key, seq))
+    // specify how output files will be named, using both the key and sequence numbers
+    .with_output_shard_naming(|key, seq| format!("data.{key}.part{seq}.csv"))
+    // aim for 1MiB of data in each output file
     .with_output_splitting(FileSplitting::SplitAfterBytes(1024 * 1024))
     .on_file_completion(|path, key| {
-        println!("The file {} is now ready for shard {}", path.display(), key);
-        // Do something more with the completed file if you want.
+        println!("The file {} is now ready for shard {key}", path.display());
+        // Do something more with the completed file if you want, eg:
+        upload_file_to_server(&path);
     });
 
 writer.process_csv(&mut reader).ok();
